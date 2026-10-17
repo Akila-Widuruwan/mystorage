@@ -151,6 +151,14 @@ You can post files into your Telegram channel **directly from any Telegram app**
 
 Notes: files import once (re-runs skip already-processed posts), and playing back files larger than 20 MB requires the self-hosted Bot API server as the channel proxy (the `docker-compose.yml` setup above).
 
+## Episode → Telegram uploader (GitHub Actions, your own account)
+
+A companion workflow, [`tools/github-workflows/episode-to-telegram.yml`](tools/github-workflows/episode-to-telegram.yml), posts finished episodes **directly into your own Telegram channel** — no storage server involved at all. It resolves the stream, downloads it, remuxes to MP4 and uploads **one single streamable video (up to 2 GB)** from **your own Telegram account** via Telethon, using up to 20 parallel connections with live upload progress in the log.
+
+- **Full guide with every setup step:** [`docs/telegram-uploader-guide.md`](docs/telegram-uploader-guide.md) (API credentials, session string, secrets, first run, troubleshooting)
+- Helper script for the one-time login: [`tools/github-workflows/generate-telegram-session.py`](tools/github-workflows/generate-telegram-session.py)
+- The old abyss upload is still available: run with **target = `abyss`** (`ABYSS_KEY` secret)
+
 ## Remote uploads from a URL (Upload page → Paste)
 
 - **Save** downloads the file through the server (`/api/fetchRes`, with SSRF protection and a browser User-Agent) and re-uploads it into your channel. Best for files up to a few hundred MB — the browser mediates the transfer.

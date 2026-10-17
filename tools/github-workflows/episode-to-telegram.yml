@@ -1,0 +1,961 @@
+name: Convert episode to mp4 -> Telegram (single file)
+
+# ONE FILE VERSION - drop this into ANY repo under .github/workflows/.
+# Same pipeline as before (animesuge resolver -> HLS download -> ffmpeg remux),
+# but instead of abyss the finished mp4 is uploaded DIRECTLY to your own
+# Telegram channel as ONE full file (up to 2 GB), streamable in Telegram.
+#
+# It uses YOUR Telegram account via Telethon (a bot could only send 50 MB).
+#
+# ------------------------------ SETUP (one time) -----------------------------
+# 1. Get your API credentials:  https://my.telegram.org -> API development tools
+#      -> App api_id  (a number)        -> repo secret TG_API_ID
+#      -> App api_hash (32 chars)       -> repo secret TG_API_HASH
+# 2. Create a "session string" for your account ON YOUR OWN PC:
+#      pip install telethon
+#      python3 generate-telegram-session.py      (helper file shipped alongside)
+#    It asks for your phone number + the login code Telegram sends to your
+#    Telegram app, then prints a long string -> repo secret TG_SESSION
+#    (Treat this string like a password: it IS your logged-in account.)
+# 3. Repo secrets:
+#      TG_API_ID, TG_API_HASH, TG_SESSION,
+#      TG_CHANNEL  - where to post: your channel's @username (public) or
+#                    numeric id like -1001234567890 (private; the account
+#                    must be in the channel)
+# Notes:
+#  - Free Telegram accounts can upload up to 2 GB per file (4 GB with Premium).
+#  - Your account appears as the sender of the posts in the channel.
+#  - Optional fallback: the old abyss upload still exists behind target=abyss.
+
+on:
+  workflow_dispatch:
+    inputs:
+      page:
+        description: 'Episode page url  (https://animesuge.cz/anime/<slug>/ep-1)'
+        required: true
+        type: string
+      name:
+        description: 'Output name (no spaces)'
+        required: true
+        type: string
+      quality:
+        description: 'best | 1080 | 720 | 480 | 360'
+        required: false
+        default: best
+        type: string
+      lang:
+        description: 'Audio track / server group'
+        required: false
+        type: choice
+        options: [sub, dub]
+        default: sub
+      server:
+        description: 'Force one server by name or sv-id (empty = try all)'
+        required: false
+        default: ''
+        type: string
+      limit:
+        description: 'Convert only the first N seconds (0 = whole episode, use 20 for a quick test)'
+        required: false
+        default: '0'
+        type: string
+
+      target:
+        description: 'Where to send the finished mp4'
+        required: false
+        default: telegram
+        type: choice
+        options: [telegram, abyss]
+permissions:
+  contents: read
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PAGE: ${{ inputs.page }}
+      NAME_IN: ${{ inputs.name }}
+      QUALITY: ${{ inputs.quality }}
+      LANG: ${{ inputs.lang }}
+      SERVER: ${{ inputs.server }}
+      LIMIT: ${{ inputs.limit }}
+      UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+    steps:
+      # The static ffmpeg builds segfault on the runner, so use the distro ffmpeg.
+      - name: Install ffmpeg
+        timeout-minutes: 10
+        run: |
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "ffmpeg already on the runner, skipping install"
+          else
+            for i in 1 2 3; do
+              if sudo timeout 120 apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update -qq \
+                 && sudo timeout 300 apt-get install -y -qq ffmpeg; then
+                break
+              fi
+              echo "::warning::apt attempt $i failed, retrying"
+              sleep 5
+            done
+          fi
+          ffmpeg -version | head -n1
+
+      - name: Write the resolver script
+        run: |
+          cat > resolve-m3u8.mjs <<'RESOLVER_EOF'
+          #!/usr/bin/env node
+          /**
+           * resolve-m3u8.mjs — AnimeSuge (animesuge.cz) episode page  ->  playable HLS URL
+           *
+           *  Why the old "grep the page for .m3u8" approach can never work:
+           *  the episode page ships no stream URL at all. The player is built at runtime
+           *  through three JSON/HTML endpoints and the final URL is AES encrypted:
+           *
+           *   page  ->  /ajax/episode/list/<animeId>          (episode -> data-ids)
+           *         ->  /ajax/server/list?servers=<ids>       (server -> data-link-id)
+           *         ->  /ajax/server?get=<link-id>            (player page URL)
+           *   player page -> <data-id> on #megaplay-player
+           *         ->  /stream/getSourcesNew?id=<data-id>     (JSON with "enc")
+           *         ->  AES-256-CBC decrypt  ->  { file: "<master.m3u8>" }
+           *
+           *  Usage:
+           *    node resolve-m3u8.mjs <episode-page-url> [--lang sub|dub] [--quality best|1080|720|480]
+           *                          [--server <name|sv-id>] [--out resolved.json]
+           *
+           *  stdout : a single-line JSON object (also written to --out when given)
+           *  stderr : human readable progress
+           *
+           *  Exit code 0 = found a stream, anything else = failure (message on stderr).
+           */
+
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+
+          const UA =
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+          // Key/IV scraped from the player's own JS (lib/app.main.js, lib/newclient.min.js).
+          // The payload is AES-256-CBC with the 16 byte secret zero padded up to 32 bytes.
+          const ENC_KEY = 'i?LMTAx0Q6,:}50U';
+          const ENC_IV = "W0;27ToaUpl_P%'c";
+
+          const log = (...a) => console.error('[resolve]', ...a);
+          class Fatal extends Error {}
+          const die = (msg) => {
+            throw new Fatal(msg);
+          };
+
+          // ---------------------------------------------------------------- CLI
+
+          function parseArgs(argv) {
+            const args = { page: '', lang: 'sub', quality: 'best', server: '', out: '' };
+            const rest = [];
+            for (let i = 0; i < argv.length; i++) {
+              const a = argv[i];
+              if (a === '--lang') args.lang = String(argv[++i] || 'sub').toLowerCase();
+              else if (a === '--quality') args.quality = String(argv[++i] || 'best');
+              else if (a === '--server') args.server = String(argv[++i] || '');
+              else if (a === '--out') args.out = String(argv[++i] || '');
+              else rest.push(a);
+            }
+            args.page = rest[0] || '';
+            return args;
+          }
+
+          // ---------------------------------------------------------------- http
+
+          async function req(url, { referer, xhr = true, timeout = 30000 } = {}) {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), timeout);
+            try {
+              const res = await fetch(url, {
+                signal: ctrl.signal,
+                redirect: 'follow',
+                headers: {
+                  'User-Agent': UA,
+                  Accept: '*/*',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  ...(xhr ? { 'X-Requested-With': 'XMLHttpRequest' } : {}),
+                  ...(referer ? { Referer: referer } : {}),
+                },
+              });
+              const body = await res.text();
+              return { status: res.status, body, url: res.url };
+            } finally {
+              clearTimeout(t);
+            }
+          }
+
+          function expect(cond, msg, extra) {
+            if (cond) return;
+            const err = new Error(msg);
+            err.detail = extra ? String(extra).slice(0, 800) : '';
+            throw err;
+          }
+
+          /** Never call process.exit(): it aborts with pending sockets (libuv assertion on
+           *  Windows). Set the exit code and let node drain instead. */
+          function fatal(e) {
+            if (e && e.detail) console.error('[resolve] unexpected response:\n' + e.detail);
+            console.error('[resolve] FATAL:', e && e.message ? e.message : String(e));
+            process.exitCode = 1;
+          }
+
+          // ---------------------------------------------------------------- steps
+
+          function readPageMeta(html, pageUrl) {
+            const animeId = (html.match(/mangaId\s*=\s*(\d+)/) || [])[1];
+            const epFromUrl = (pageUrl.match(/\/ep-([0-9.]+)/) || [])[1];
+            const epAttr = (html.match(/data-ep-name="([^"]*)"/) || [])[1];
+            return { animeId, episode: epFromUrl || epAttr };
+          }
+
+          function findEpisodeIds(listHtml, episode) {
+            const anchors = [...listHtml.matchAll(/<a\b[^>]*data-num="[^"]*"[^>]*>/g)].map((m) => m[0]);
+            if (!anchors.length) return null;
+            const attr = (tag, name) => (tag.match(new RegExp(name + '="([^"]*)"')) || [])[1] || '';
+            const want = String(episode ?? '').trim();
+
+            let pick =
+              anchors.find((a) => attr(a, 'data-slug') === want) ||
+              anchors.find((a) => attr(a, 'data-num').replace(/[^0-9.]/g, '') === want);
+            if (!pick && anchors.length === 1) pick = anchors[0];
+            if (!pick) return null;
+            return { ids: attr(pick, 'data-ids'), slug: attr(pick, 'data-slug'), num: attr(pick, 'data-num') };
+          }
+
+          function parseServers(serverListHtml) {
+            // The list is grouped in <div class="server-type ..." data-type="sub|dub"> blocks.
+            const parts = serverListHtml.split(/<div[^>]*class="server-type[^"]*"[^>]*>/);
+            const groups = [];
+            for (let i = 1; i < parts.length; i++) {
+              const type = (parts[i - 1] === '' ? parts[i] : parts[i]).match(/^[^>]*data-type="([^"]+)"/);
+              groups.push({ type: type ? type[1] : 'sub', html: parts[i] });
+            }
+            const out = [];
+            for (const g of groups) {
+              const bodies = g.html.split('<div class="server"').slice(1);
+              for (const b of bodies) {
+                const linkId = (b.match(/data-link-id="([^"]*)"/) || [])[1];
+                const svId = (b.match(/data-sv-id="([^"]*)"/) || [])[1];
+                const name = (b.match(/<span>([^<]*)<\/span>/) || [])[1];
+                if (linkId) out.push({ type: g.type, linkId, svId, name: (name || '').trim() });
+              }
+            }
+            return out;
+          }
+
+          function decryptSources(enc) {
+            const key = Buffer.alloc(32);
+            Buffer.from(ENC_KEY, 'utf8').copy(key, 0, 0, 16);
+            const iv = Buffer.from(ENC_IV, 'utf8').subarray(0, 16);
+            const raw = Buffer.from(String(enc).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+            const d = crypto.createDecipheriv('aes-256-cbc', key, iv);
+            d.setAutoPadding(false);
+            const text = Buffer.concat([d.update(raw), d.final()]).toString('utf8');
+            const json = text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
+            return JSON.parse(json);
+          }
+
+          async function pickVariant(masterUrl, quality, referer) {
+            const { status, body } = await req(masterUrl, { referer });
+            expect(status === 200 && body.includes('#EXTM3U'), 'could not download the master playlist', body);
+
+            const lines = body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+            const variants = [];
+            for (let i = 0; i < lines.length; i++) {
+              if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+              const next = lines.slice(i + 1).find((l) => !l.startsWith('#'));
+              if (!next) continue;
+              const res = (lines[i].match(/RESOLUTION=(\d+)x(\d+)/) || [])[2];
+              const bw = Number((lines[i].match(/BANDWIDTH=(\d+)/) || [])[1] || 0);
+              variants.push({ height: Number(res || 0), bw, url: new URL(next, masterUrl).href });
+            }
+            if (!variants.length) return { url: masterUrl, variants: [], picked: null };
+
+            variants.sort((a, b) => b.height - a.height || b.bw - a.bw);
+            const want = String(quality || 'best').replace(/p$/i, '');
+            const picked =
+              want === 'best'
+                ? variants[0]
+                : variants.find((v) => String(v.height) === want) || variants[0];
+            return { url: picked.url, variants, picked };
+          }
+
+          // ---------------------------------------------------------------- main
+
+          const args = parseArgs(process.argv.slice(2));
+          if (!args.page) {
+            fatal(new Error('usage: node resolve-m3u8.mjs <episode-page-url> [--lang sub|dub] [--quality best]'));
+            process.exit(1);
+          }
+
+          const pageUrl = args.page;
+          const origin = new URL(pageUrl).origin;
+          log('episode page:', pageUrl);
+
+          // Labelled so a fatal error can bail out of the whole pipeline without
+          // process.exit() (which aborts with pending sockets).
+          main: {
+          let meta, ep, servers;
+          try {
+            // 1. episode page ---------------------------------------------------
+            const page = await req(pageUrl, { xhr: false });
+            expect(page.status === 200, `episode page returned HTTP ${page.status}`, page.body);
+            expect(
+              !/just a moment|cf-challenge|Enable JavaScript and cookies/i.test(page.body),
+              'blocked by Cloudflare on this network — the page came back as a challenge',
+              page.body,
+            );
+
+            meta = readPageMeta(page.body, pageUrl);
+            expect(meta.animeId, 'could not read the anime id from the episode page', page.body);
+            log('anime id:', meta.animeId, '| episode:', meta.episode);
+
+            // 2. episode list ---------------------------------------------------
+            const listRes = await req(`${origin}/ajax/episode/list/${meta.animeId}`, { referer: pageUrl });
+            expect(listRes.status === 200, `episode list returned HTTP ${listRes.status}`, listRes.body);
+            let listHtml = listRes.body;
+            try {
+              listHtml = JSON.parse(listRes.body).result ?? listRes.body;
+            } catch {
+              /* endpoint already returned raw html */
+            }
+
+            ep = findEpisodeIds(listHtml, meta.episode);
+            expect(ep && ep.ids, `could not find the server list for episode ${meta.episode}`, listHtml);
+            log(`episode ${ep.slug || meta.episode} (${ep.num}) -> server ids found`);
+
+            // 3. server list ----------------------------------------------------
+            const srvRes = await req(`${origin}/ajax/server/list?servers=${encodeURIComponent(ep.ids)}`, {
+              referer: pageUrl,
+            });
+            expect(srvRes.status === 200, `server list returned HTTP ${srvRes.status}`, srvRes.body);
+            let srvHtml = srvRes.body;
+            try {
+              srvHtml = JSON.parse(srvRes.body).result ?? srvRes.body;
+            } catch {
+              /* raw html */
+            }
+
+            servers = parseServers(srvHtml);
+            expect(servers.length, 'no streaming servers returned for this episode', srvHtml);
+            log('servers:', servers.map((s) => `${s.type}/${s.name}`).join(', '));
+          } catch (e) {
+            fatal(e);
+            break main;
+          }
+
+          const wantedType = args.lang === 'dub' ? 'dub' : 'sub';
+          let candidates = servers.filter((s) => s.type === wantedType);
+          if (!candidates.length) candidates = servers; // fall back to whatever exists
+          if (args.server) {
+            const q = args.server.toLowerCase();
+            const filtered = candidates.filter(
+              (s) => String(s.svId).toLowerCase() === q || (s.name || '').toLowerCase().includes(q),
+            );
+            if (filtered.length) candidates = filtered;
+          }
+          log('trying servers:', candidates.map((s) => `${s.name}(${s.svId})`).join(', '));
+
+          // 4..6. per server: player page -> getSourcesNew -> decrypt -> m3u8 ---
+          const errors = [];
+          let resolved = null;
+          for (const srv of candidates) {
+            try {
+              log(`--- ${srv.name} (sv-id ${srv.svId}) ---`);
+              const src = await req(`${origin}/ajax/server?get=${encodeURIComponent(srv.linkId)}`, {
+                referer: pageUrl,
+              });
+              expect(src.status === 200, `server endpoint returned HTTP ${src.status}`, src.body);
+              const playerUrl = JSON.parse(src.body)?.result?.url;
+              expect(playerUrl, `no player url for ${srv.name}`, src.body);
+              log('player:', playerUrl);
+
+              const player = await req(playerUrl, { referer: pageUrl });
+              expect(player.status === 200, `player page returned HTTP ${player.status}`, player.body);
+              const fileId = (player.body.match(/data-id="(\d+)"/) || [])[1];
+              expect(fileId, `no file id in the player page (${srv.name})`, player.body);
+
+              const s = new URL(playerUrl).searchParams.get('s');
+              const api =
+                `${new URL(playerUrl).origin}/stream/getSourcesNew?id=${fileId}` + (s ? `&s=${s}` : '');
+              const sources = await req(api, { referer: playerUrl });
+              expect(sources.status === 200, `getSourcesNew returned HTTP ${sources.status}`, sources.body);
+
+              const payload = JSON.parse(sources.body);
+              const decrypted = payload.file ? payload : decryptSources(payload.enc);
+              const masterUrl = decrypted.file || decrypted.url;
+              expect(masterUrl, `could not decrypt the stream url for ${srv.name}`, sources.body);
+
+              const quality = await pickVariant(masterUrl, args.quality, new URL(playerUrl).origin + '/');
+              log('master  :', masterUrl);
+              if (quality.variants.length) {
+                log('variants:', quality.variants.map((v) => `${v.height}p`).join(', '));
+                log('chosen  :', quality.picked ? `${quality.picked.height}p` : quality.url);
+              }
+
+              const result = {
+                ok: true,
+                page: pageUrl,
+                animeId: Number(meta.animeId),
+                episode: meta.episode,
+                server: srv.name,
+                serverSvId: srv.svId,
+                type: srv.type,
+                playerUrl,
+                fileId: Number(fileId),
+                master: masterUrl,
+                m3u8: quality.url,
+                variants: quality.variants.map((v) => ({ height: v.height, bandwidth: v.bw, url: v.url })),
+                subtitles: (payload.tracks || []).map((t) => ({ label: t.label, file: t.file })),
+                // The CDN only serves the stream when the player page is the referer.
+                referer: new URL(playerUrl).origin + '/',
+              };
+              if (args.out) fs.writeFileSync(args.out, JSON.stringify(result, null, 2));
+              console.log(JSON.stringify(result));
+              resolved = result;
+              break;
+            } catch (e) {
+              errors.push(`${srv.name}: ${e.message}`);
+              console.error('[resolve] server failed:', e.message);
+            }
+          }
+
+          if (!resolved) {
+            fatal(new Error('every server failed -> ' + errors.join(' | ')));
+          }
+          } // end main
+          RESOLVER_EOF
+          node --check resolve-m3u8.mjs
+          echo "resolver written ($(wc -l < resolve-m3u8.mjs) lines)"
+
+      - name: Resolve a fresh m3u8 link
+        run: |
+          set -o pipefail
+
+          ARGS=(--lang "$LANG" --quality "$QUALITY")
+          [ -n "$SERVER" ] && ARGS+=(--server "$SERVER")
+
+          # The resolved url is short lived and bound to this runner's ip,
+          # so it is resolved here and consumed below, never reused elsewhere.
+          node resolve-m3u8.mjs "$PAGE" "${ARGS[@]}" --out resolved.json
+
+          echo "--- resolved.json ---"
+          cat resolved.json
+
+      - name: Download and remux to mp4
+        run: |
+          set -o pipefail
+
+          cat > download-hls.mjs <<'DL_EOF'
+          // download-hls.mjs <m3u8> <referer> <out.ts> [limitSeconds]
+          // Downloads HLS segments, strips the fake PNG header the CDN prepends,
+          // and writes one clean MPEG-TS file.
+          import fs from 'node:fs';
+          import crypto from 'node:crypto';
+
+          const [m3u8, referer, out, limitArg] = process.argv.slice(2);
+          const limit = Number(limitArg || 0);
+          const UA = process.env.UA || 'Mozilla/5.0';
+          const headers = { 'User-Agent': UA, Referer: referer, Accept: '*/*' };
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          let pause = 0; // shared delay between batches, grows when the CDN says 429
+
+          async function get(url, buf = true, tries = 10) {
+            let last;
+            for (let i = 1; i <= tries; i++) {
+              try {
+                const r = await fetch(url, { headers });
+                if (r.status === 429 || r.status >= 500) {
+                  // rate limited / server hiccup: back off hard, honour Retry-After
+                  const ra = Number(r.headers.get('retry-after'));
+                  const wait = ra > 0 ? ra * 1000 : Math.min(60000, 2000 * 2 ** (i - 1));
+                  pause = Math.min(3000, pause + 500);
+                  last = new Error('HTTP ' + r.status);
+                  console.log(`HTTP ${r.status}, waiting ${Math.round(wait / 1000)}s (try ${i}/${tries})`);
+                  await sleep(wait + Math.random() * 1000);
+                  continue;
+                }
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return buf ? Buffer.from(await r.arrayBuffer()) : await r.text();
+              } catch (e) {
+                last = e;
+                await sleep(1000 * i);
+              }
+            }
+            throw new Error(url + ' -> ' + last.message);
+          }
+
+          // find the first offset where 0x47 repeats every 188 bytes (real TS data)
+          function syncOffset(b) {
+            const max = Math.min(b.length - 376, 8192);
+            for (let i = 0; i < max; i++) {
+              if (b[i] === 0x47 && b[i + 188] === 0x47 && b[i + 376] === 0x47) return i;
+            }
+            return -1;
+          }
+
+          const text = await get(m3u8, false);
+          if (!text.includes('#EXTM3U')) throw new Error('not a playlist');
+
+          const segs = [];
+          let key = null, dur = 0, seq = 0;
+          for (const line of text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)) {
+            if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) seq = Number(line.split(':')[1]);
+            else if (line.startsWith('#EXT-X-KEY:')) {
+              const method = (line.match(/METHOD=([^,]+)/) || [])[1];
+              const uri = (line.match(/URI="([^"]+)"/) || [])[1];
+              const iv = (line.match(/IV=0x([0-9a-fA-F]+)/) || [])[1];
+              key = method === 'AES-128' ? { uri: new URL(uri, m3u8).href, iv } : null;
+            } else if (line.startsWith('#EXTINF:')) dur = parseFloat(line.slice(8));
+            else if (!line.startsWith('#')) {
+              segs.push({ url: new URL(line, m3u8).href, dur, key, seq: seq + segs.length });
+              dur = 0;
+            }
+          }
+          if (!segs.length) throw new Error('playlist has no segments');
+
+          let list = segs, total = 0;
+          if (limit > 0) {
+            list = [];
+            for (const s of segs) { list.push(s); total += s.dur; if (total >= limit) break; }
+          }
+          console.log(`segments: ${list.length}/${segs.length}`);
+
+          const keyCache = new Map();
+          async function fetchSeg(s) {
+            let b = await get(s.url);
+            let off = syncOffset(b);
+            if (off < 0 && s.key) {
+              if (!keyCache.has(s.key.uri)) keyCache.set(s.key.uri, await get(s.key.uri));
+              const iv = s.key.iv
+                ? Buffer.from(s.key.iv.padStart(32, '0'), 'hex')
+                : Buffer.from(s.seq.toString(16).padStart(32, '0'), 'hex');
+              const d = crypto.createDecipheriv('aes-128-cbc', keyCache.get(s.key.uri), iv);
+              d.setAutoPadding(false);
+              b = Buffer.concat([d.update(b.subarray(0, b.length - (b.length % 16))), d.final()]);
+              off = syncOffset(b);
+            }
+            if (off < 0) throw new Error('no TS data found in segment ' + s.url);
+            return off ? b.subarray(off) : b;
+          }
+
+          const fd = fs.openSync(out, 'w');
+          const CONC = 3;
+          let done = 0;
+          for (let i = 0; i < list.length; i += CONC) {
+            const parts = await Promise.all(list.slice(i, i + CONC).map(fetchSeg));
+            for (const p of parts) fs.writeSync(fd, p);
+            done += parts.length;
+            if ((i / CONC) % 10 === 0 || done === list.length) console.log(`downloaded ${done}/${list.length}`);
+            pause = Math.max(0, pause - 100);
+            if (pause) await sleep(pause);
+          }
+          fs.closeSync(fd);
+          DL_EOF
+          node --check download-hls.mjs
+
+          FILE="${NAME_IN// /_}.mp4"
+          resolved=0
+          for attempt in 1 2 3; do
+            if [ "$attempt" -gt 1 ]; then
+              echo "::warning::attempt $((attempt-1)) failed — resolving a brand new link and retrying"
+              sleep 10
+              ARGS=(--lang "$LANG" --quality "$QUALITY")
+              [ -n "$SERVER" ] && ARGS+=(--server "$SERVER")
+              node resolve-m3u8.mjs "$PAGE" "${ARGS[@]}" --out resolved.json || continue
+            fi
+
+            M3U8=$(node -p "require('./resolved.json').m3u8")
+            REFERER=$(node -p "require('./resolved.json').referer")
+            echo "stream  : $M3U8"
+            echo "referer : $REFERER"
+
+            rm -f "$FILE" episode.ts
+
+            if node download-hls.mjs "$M3U8" "$REFERER" episode.ts "${LIMIT:-0}" \
+               && [ -s episode.ts ] \
+               && ffmpeg -hide_banner -nostdin -loglevel warning -stats -stats_period 20 \
+                    -fflags +genpts -i episode.ts \
+                    -c copy -bsf:a aac_adtstoasc -movflags +faststart \
+                    -y "$FILE" \
+               && [ -s "$FILE" ]; then
+              resolved=1
+              rm -f episode.ts
+              break
+            fi
+          done
+
+          if [ "$resolved" != "1" ]; then
+            echo "::error::conversion failed after 3 attempts — see the log above"
+            exit 1
+          fi
+
+          ls -lh "$FILE"
+
+      - name: Verify the output
+        run: |
+          set -o pipefail
+
+          FILE="${NAME_IN// /_}.mp4"
+          SIZE=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null || echo 0)
+          STREAMS=$(ffprobe -v error -show_entries stream=codec_name,width,height -of csv=p=0 "$FILE" | tr '\n' ' ')
+          SERVER_NAME=$(node -p "require('./resolved.json').server")
+          STREAM_URL=$(node -p "require('./resolved.json').m3u8")
+
+          echo "size: $SIZE bytes | duration: ${DURATION}s | streams: $STREAMS"
+
+          if [ "${SIZE:-0}" -lt 1000000 ]; then
+            echo "::error::$FILE is smaller than 1 MB — the stream was not downloaded"
+            exit 1
+          fi
+          # only enforced for full episodes, skipped for tests run with `limit`
+          if [ "${LIMIT:-0}" = "0" ] && node -e 'process.exit(Number(process.argv[1]) < 60 ? 0 : 1)' "$DURATION"; then
+            echo "::error::$FILE is shorter than 60s — the download stopped early"
+            exit 1
+          fi
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### $FILE"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| page | $PAGE |"
+              echo "| server | $SERVER_NAME |"
+              echo "| stream | $STREAM_URL |"
+              echo "| size | $SIZE bytes |"
+              echo "| duration | ${DURATION}s |"
+              echo "| streams | $STREAMS |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # ─────────────────────────────────────────────────────────────────────
+      # abyss hand-off
+      #
+      #   POST https://up.abyss.to/<apiKey>      (multipart/form-data, field "file")
+      #   ->  {"slug": "file-id"}
+      #
+      # The key is NOT in this file. It lives in the repo secrets as ABYSS_KEY:
+      #   repo -> Settings -> Secrets and variables -> Actions -> New repository
+      #   secret -> Name: ABYSS_KEY   Secret: <your key>
+      #
+      # https is used on purpose: with http the api key would travel in cleartext.
+      # curl -F already sets the multipart content-type (with its boundary).
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: Upload to Telegram
+        if: inputs.target == 'telegram'
+        timeout-minutes: 60
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHANNEL: ${{ secrets.TG_CHANNEL }}
+          TELETHON_TIMEOUT: 300
+        run: |
+          set -o pipefail
+
+          FILE="${NAME_IN// /_}.mp4"
+          [ -s "$FILE" ] || { echo "::error::$FILE is missing - the download step must finish before this one"; exit 1; }
+
+          for s in TG_API_ID TG_API_HASH TG_SESSION TG_CHANNEL; do
+            [ -n "${!s:-}" ] || { echo "::error::secret $s is not set - add it under Settings -> Secrets and variables -> Actions"; exit 1; }
+          done
+
+          pip install -q telethon cryptg FastTelethonhelper
+
+          # small auto thumbnail (best-effort): 1-minute mark first, retry near the start for short clips
+          THUMB="thumb.jpg"
+          ffmpeg -hide_banner -loglevel error -y -ss 60 -i "$FILE" -vframes 1 -q:v 3 "$THUMB" 2>/dev/null || true
+          [ -s "$THUMB" ] || ffmpeg -hide_banner -loglevel error -y -ss 1 -i "$FILE" -vframes 1 -q:v 3 "$THUMB" 2>/dev/null || true
+          [ -s "$THUMB" ] || THUMB=""
+
+          VDUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$FILE" 2>/dev/null | head -1)
+          VWID=$(ffprobe -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$FILE" 2>/dev/null | head -1)
+          VHEI=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$FILE" 2>/dev/null | head -1)
+          export VIDEO_DURATION="${VDUR:-}" VIDEO_WIDTH="${VWID:-}" VIDEO_HEIGHT="${VHEI:-}"
+
+          export FILE_PATH="$PWD/$FILE"
+          export CAPTION="$NAME_IN"
+          if [ -s "$THUMB" ]; then export THUMB_PATH="$THUMB"; else export THUMB_PATH=""; fi
+
+          python3 -u - <<'PYEOF'
+          import asyncio, os, re, sys, time
+
+          try:
+              from telethon import TelegramClient
+              from telethon.errors import FloodWaitError, RPCError
+              from telethon.sessions import StringSession
+              from telethon.tl.types import DocumentAttributeVideo
+          except ImportError:
+              print("::error::telethon is not installed - the pip install above failed")
+              sys.exit(1)
+
+          # parallel uploader (up to 20 connections); optional, we fall back if missing
+          try:
+              from FastTelethonhelper.FastTelethon import upload_file as parallel_upload
+              HAVE_PARALLEL = True
+          except Exception:
+              HAVE_PARALLEL = False
+
+          API_ID   = int(os.environ["TG_API_ID"])
+          API_HASH = os.environ["TG_API_HASH"]
+          SESSION  = os.environ["TG_SESSION"]
+          CHAT     = os.environ["TG_CHANNEL"]
+          FILE     = os.environ["FILE_PATH"]
+          CAPTION  = os.environ.get("CAPTION", "")
+          THUMB    = os.environ.get("THUMB_PATH", "")
+
+          MAX_BYTES = 2 * 1024 * 1024 * 1024 - 5 * 1024 * 1024   # 2 GB minus safety margin
+
+          if not os.path.isfile(FILE):
+              print(f"::error::{FILE} does not exist")
+              sys.exit(1)
+          size = os.path.getsize(FILE)
+          if size > MAX_BYTES:
+              print(f"::error::{FILE} is {size/1048576:.0f} MB - Telegram accounts allow 2 GB per file "
+                    f"(4 GB with Premium). Use a lower quality.")
+              sys.exit(1)
+
+          def parse_chat(raw):
+              # accepts:  @username   |   -1001234567890   |   https://t.me/name
+              #           https://t.me/c/1234567890/5  (private-channel link form)
+              raw = raw.strip().strip('"').strip("'")
+              if raw.startswith("@"):
+                  return raw
+              m = re.fullmatch(r"https?://t\.me/(?:c/)?(-?\d+)(?:/\d+)?", raw)
+              if m:
+                  n = m.group(1)
+                  return int(n) if n.startswith("-") else int("-100" + n)
+              if re.fullmatch(r"-?\d+", raw):
+                  return int(raw)
+              m = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]+)/?", raw)
+              if m:
+                  return "@" + m.group(1)
+              return raw
+
+          async def list_my_channels(client):
+              print("   channels/groups this account can post in:")
+              found = False
+              async for d in client.iter_dialogs():
+                  if d.is_channel or d.is_group:
+                      found = True
+                      print(f"   id={d.id}   {d.title}")
+              if not found:
+                  print("   (none - this account is not in any channel/group)")
+
+          async def resolve_channel(client, chat):
+              # A brand-new session string has never seen any channel, and PRIVATE
+              # channels cannot be resolved from a bare -100 id alone - the access
+              # hash only exists in the account's dialog list. Scan dialogs once
+              # to fill the cache, then resolve.
+              try:
+                  async for _ in client.iter_dialogs():
+                      pass
+              except Exception as e:
+                  print(f"::warning::could not scan the dialog list: {e}")
+              try:
+                  return await client.get_entity(chat)
+              except ValueError:
+                  print("::error::could not resolve TG_CHANNEL - nothing with that exact "
+                        "@username / id is visible to this account. (The channel NAME, "
+                        "e.g. 'server1', does NOT work - use the @username or the id.)")
+                  await list_my_channels(client)
+                  print("Copy one of the ids above (or the @username) into the TG_CHANNEL secret and re-run.")
+                  sys.exit(2)
+
+          def tme_link(entity, msg_id):
+              # public channel with a username -> https://t.me/<user>/<id>
+              # private channel                -> https://t.me/c/<internal>/<id>
+              uname = getattr(entity, "username", None)
+              if uname:
+                  return f"https://t.me/{uname}/{msg_id}"
+              internal = str(entity.id).replace("-100", "", 1)
+              return f"https://t.me/c/{internal}/{msg_id}"
+
+          last_tenth = [0]
+
+          def progress(cur, tot):
+              # Telethon calls this very often - print roughly every 10%
+              pct = int(cur * 100 / tot) if tot else 0
+              if pct // 10 > last_tenth[0] or pct == 100:
+                  last_tenth[0] = pct // 10
+                  print(f"upload: {pct:3d}% ({cur/1048576:,.0f} / {tot/1048576:,.0f} MB)")
+
+          def env_int(name, default):
+              try:
+                  return int(float(os.environ.get(name) or default))
+              except Exception:
+                  return default
+
+          async def send_with_retries(client, entity, **kw):
+              for attempt in (1, 2, 3):
+                  try:
+                      return await client.send_file(entity, **kw)
+                  except FloodWaitError as e:
+                      if attempt == 3:
+                          raise
+                      wait = int(getattr(e, "seconds", 30)) + 5
+                      print(f"::warning::FloodWait: sleeping {wait}s (attempt {attempt}/3)")
+                      time.sleep(wait)
+                  except RPCError as e:
+                      if attempt == 3:
+                          raise
+                      print(f"::warning::{type(e).__name__}: retrying (attempt {attempt}/3)")
+                      time.sleep(10)
+
+          async def main():
+              client = TelegramClient(StringSession(SESSION), API_ID, API_HASH,
+                                      timeout=int(os.environ.get("TELETHON_TIMEOUT", "300")))
+              await client.connect()
+              if not await client.is_user_authorized():
+                  print("::error::TG_SESSION is not authorized - regenerate it with "
+                        "generate-telegram-session.py on your PC")
+                  sys.exit(2)
+              me = await client.get_me()
+              if getattr(me, "bot", False):
+                  print("::error::TG_SESSION is a BOT session, not your account. Re-run "
+                        "generate-telegram-session.py and enter your PHONE NUMBER "
+                        "(e.g. +9477xxxxxxx), NOT the bot token.")
+                  sys.exit(2)
+              who = " ".join(filter(None, [getattr(me, "first_name", ""), getattr(me, "last_name", "")]))
+              print(f"posting as: {who} (@{getattr(me, 'username', 'no-username')})")
+              entity = await resolve_channel(client, parse_chat(CHAT))
+
+              dur = env_int("VIDEO_DURATION", 0)
+              wid = env_int("VIDEO_WIDTH", 1280)
+              hei = env_int("VIDEO_HEIGHT", 720)
+              video_attrs = [DocumentAttributeVideo(dur, wid, hei, supports_streaming=True)]
+
+              title = getattr(entity, "title", CHAT)
+              try:
+                  handle = None
+                  if HAVE_PARALLEL:
+                      print(f"posting {FILE} ({size/1048576:.1f} MB) to {title} "
+                            f"[parallel upload, up to 20 connections]")
+                      try:
+                          with open(FILE, "rb") as fh:
+                              handle = await parallel_upload(client=client, file=fh,
+                                                             name=os.path.basename(FILE),
+                                                             progress_callback=progress)
+                      except (FloodWaitError, RPCError):
+                          raise                      # telegram-side limit: slow path would hit it too
+                      except Exception as e:
+                          print(f"::warning::parallel uploader failed ({type(e).__name__}: {e}) - "
+                                f"using the normal uploader")
+                          handle = None
+                      if handle is not None:
+                          # the handle is a bare upload - attach video attributes so it
+                          # shows as a streamable player, not as a plain document
+                          msg = await send_with_retries(
+                              client, entity, file=handle,
+                              caption=CAPTION, mime_type="video/mp4",
+                              attributes=video_attrs, thumb=THUMB or None,
+                          )
+                  if handle is None:
+                      print(f"posting {FILE} ({size/1048576:.1f} MB) to {title} [normal uploader]")
+                      msg = await send_with_retries(
+                          client, entity, file=FILE,
+                          caption=CAPTION, supports_streaming=True,
+                          force_document=False, thumb=THUMB or None,
+                          progress_callback=progress,
+                      )
+              except (FloodWaitError, RPCError) as e:
+                  print(f"::error::upload failed after 3 attempts: {e}")
+                  sys.exit(1)
+
+              link = tme_link(entity, msg.id)
+              print(f"uploaded: {link}")
+              if os.environ.get("GITHUB_OUTPUT"):
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write(f"link={link}\nmessage_id={msg.id}\n")
+              if os.environ.get("GITHUB_STEP_SUMMARY"):
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write(f"| link | {link} |\n| file | {FILE} |\n| size | {size} bytes |\n")
+
+          asyncio.run(main())
+          PYEOF
+      - name: Upload to abyss
+        if: inputs.target == 'abyss'
+        env:
+          ABYSS_KEY: ${{ secrets.ABYSS_KEY }}
+        run: |
+          set -o pipefail
+
+          FILE="${NAME_IN// /_}.mp4"
+
+          # Clean the secret: strip spaces, newlines, carriage returns and quotes
+          # (a stray one of these makes curl fail with "Malformed input to a URL function").
+          ABYSS_KEY="$(printf '%s' "$ABYSS_KEY" | tr -d '[:space:]"'"'"'')"
+          # If the whole upload url was pasted as the secret, keep only the key part.
+          ABYSS_KEY="${ABYSS_KEY##*/}"
+
+          if [ -z "$ABYSS_KEY" ]; then
+            echo "::error::the ABYSS_KEY secret is empty — add it under Settings -> Secrets and variables -> Actions"
+            exit 1
+          fi
+          echo "::add-mask::$ABYSS_KEY"
+          echo "abyss key length: ${#ABYSS_KEY} chars"
+
+          if [ ! -s "$FILE" ]; then
+            echo "::error::$FILE is missing — the download step must finish before this one"
+            exit 1
+          fi
+          FILE_SIZE=$(stat -c%s "$FILE")
+
+          RESPONSE_FILE=abyss-response.json
+          HTTP_CODE=$(curl -sS --retry 3 --retry-delay 5 --retry-all-errors --max-time 3600 \
+            -o "$RESPONSE_FILE" -w '%{http_code}' \
+            -F "file=@$FILE" \
+            "https://up.abyss.to/$ABYSS_KEY")
+
+          echo "abyss -> HTTP $HTTP_CODE"
+          [ -s "$RESPONSE_FILE" ] && cat "$RESPONSE_FILE" && echo
+
+          if [ "$HTTP_CODE" = "401" ]; then
+            echo "::error::abyss refused the upload with 401 — the API key in the ABYSS_KEY secret is wrong or expired"
+            exit 1
+          fi
+          case "$HTTP_CODE" in
+            2*) ;;
+            *) echo "::error::abyss upload failed with HTTP $HTTP_CODE"; exit 1 ;;
+          esac
+
+          SLUG=$(node -e "const r=JSON.parse(require('fs').readFileSync('abyss-response.json','utf8'));process.stdout.write(String(r.slug||''))")
+          if [ -z "$SLUG" ]; then
+            echo "::error::abyss replied without a slug — see the response above"
+            exit 1
+          fi
+
+          echo "abyss slug: $SLUG"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "### Uploaded to abyss"
+              echo ""
+              echo "| | |"
+              echo "|---|---|"
+              echo "| slug | \`$SLUG\` |"
+              echo "| file | $FILE |"
+              echo "| size | $FILE_SIZE bytes |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Small debug artifact only — the mp4 goes to abyss, not to github, so the
+      # free 500 MB artifact quota is never touched. continue-on-error because a
+      # full quota must not fail an otherwise successful upload.
+      - name: Save the resolved link (debug)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-link
+          path: resolved.json
+          retention-days: 1
+          if-no-files-found: ignore

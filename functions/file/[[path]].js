@@ -199,9 +199,19 @@ export async function onRequest(context) {  // Contents of context object
         if (filePath === null) {
             return new Response('Error: Failed to fetch image path', { status: 500 });
         }
-        // 使用代理域名或官方域名
-        const fileDomain = TgProxyUrl ? `https://${TgProxyUrl}` : 'https://api.telegram.org';
-        targetUrl = `${fileDomain}/file/bot${TgBotToken}/${filePath}`;
+        // Build the download URL for this Telegram file.
+        // - Self-hosted Bot API server in --local mode: getFile returns an absolute
+        //   disk path and /file/bot... HTTP downloads are disabled; rewrite the path
+        //   against the bundled file server (FILE_SERVER=1, see TG_FILE_SERVER_URL).
+        // - Otherwise: use the proxy domain (scheme-aware) or the official API.
+        const tgFileServer = (typeof process !== 'undefined' && process.env && process.env.TG_FILE_SERVER_URL) || '';
+        if (tgFileServer) {
+            const rel = String(filePath).replace('/var/lib/telegram-bot-api/', '');
+            targetUrl = `${tgFileServer.replace(/\/+$/, '')}/${rel}`;
+        } else {
+            const fileDomain = TgProxyUrl ? (/^https?:\/\//i.test(TgProxyUrl) ? TgProxyUrl.replace(/\/+$/, '') : `https://${TgProxyUrl}`) : 'https://api.telegram.org';
+            targetUrl = `${fileDomain}/file/bot${TgBotToken}/${String(filePath).replace(/^\/+/, '')}`;
+        }
     } else {
         targetUrl = 'https://telegra.ph/' + url.pathname + url.search;
     }

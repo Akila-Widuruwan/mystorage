@@ -134,7 +134,15 @@ export class TelegramAPI {
             throw new Error(`File path not found for fileId: ${fileId}`);
         }
 
-        const fullURL = `${this.fileDomain}/file/bot${this.botToken}/${filePath}`;
+        // In --local mode (self-hosted Bot API server) getFile returns an absolute
+        // disk path and the server does NOT expose /file/bot... HTTP downloads.
+        // If TG_FILE_SERVER_URL points at the image's bundled file server
+        // (FILE_SERVER=1, nginx with Range support), rewrite the absolute path
+        // into a token-less URL against it. Otherwise keep the cloud URL form.
+        const tgFileServer = (typeof process !== 'undefined' && process.env && process.env.TG_FILE_SERVER_URL) || '';
+        const fullURL = tgFileServer
+            ? `${tgFileServer.replace(/\/+$/, '')}/${String(filePath).replace('/var/lib/telegram-bot-api/', '')}`
+            : `${this.fileDomain}/file/bot${this.botToken}/${String(filePath).replace(/^\/+/, '')}`;
         const response = await fetch(fullURL, {
             headers: this.defaultHeaders
         });

@@ -533,8 +533,9 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
 
 
         // 图像审查（使用代理域名或官方域名）
-        const moderateDomain = tgProxyUrl ? `https://${tgProxyUrl}` : 'https://api.telegram.org';
-        const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${filePath}`;
+        // Scheme-aware proxy URL (local Bot API servers usually run plain HTTP).
+        const moderateDomain = tgProxyUrl ? (/^https?:\/\//i.test(tgProxyUrl) ? tgProxyUrl.replace(/\/+$/, '') : `https://${tgProxyUrl}`) : 'https://api.telegram.org';
+        const moderateUrl = `${moderateDomain}/file/bot${tgBotToken}/${String(filePath).replace(/^\/+/, '')}`;
         metadata.Label = await moderateContent(env, moderateUrl);
 
         // 更新metadata，写入KV数据库

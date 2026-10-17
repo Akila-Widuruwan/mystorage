@@ -330,7 +330,11 @@ const app = new Hono();
 const FUNCTION_PREFIXES = ['/api/', '/upload', '/file/', '/dav/', '/random'];
 
 function isFunctionPath(pathname) {
-    return FUNCTION_PREFIXES.some(prefix => pathname.startsWith(prefix));
+    if (FUNCTION_PREFIXES.some(prefix => pathname.startsWith(prefix))) return true;
+    // Functions may live at any path (e.g. top-level pages like /telegram-import).
+    // Match Cloudflare Pages behavior: if a function file exists for the path,
+    // route to it instead of falling through to static assets.
+    return findFunctionFile(pathname) !== null;
 }
 
 // Functions 路由处理 - 处理所有 HTTP 方法

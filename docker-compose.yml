@@ -1,7 +1,7 @@
 services:
   animelk-storage:
     # Build from this repo (needed! the upstream Docker Hub image does NOT
-    # include the TG_MAX_SINGLE_MB full-file upload feature).
+    # include the TG_MAX_SINGLE_MB / TG_FILE_SERVER_URL full-file features).
     build: .
     image: animelk-storage:local
     environment:
@@ -11,6 +11,11 @@ services:
       # Requires the telegram-bot-api service below (--local mode) and the
       # Telegram channel's "Proxy URL" setting set to http://telegram-bot-api:8088
       TG_MAX_SINGLE_MB: "1900"
+      # Serve Telegram files through the Bot API server's bundled file server
+      # (FILE_SERVER=1). In --local mode getFile returns absolute disk paths and
+      # the /file/bot... HTTP download route is disabled; this rewrites download
+      # URLs to the file server (token-less URLs with HTTP Range support).
+      TG_FILE_SERVER_URL: "http://telegram-bot-api:8080"
     ports:
       - "7658:8080"
     volumes:
@@ -24,6 +29,11 @@ services:
   # 2000 MB upload / unlimited download, so full MP4 files can be sent
   # to your Telegram channel in ONE request and streamed back by the app.
   #
+  # IMPORTANT: config is via environment variables - this image's entrypoint
+  # builds the command line itself (a `command:` line is ignored).
+  # The maintained gramiojs image is used (the aiogram image has not been
+  # rebuilt since 2022 and its /file/ download route does not work).
+  #
   # One-time setup:
   #   1. Get free api_id + api_hash at https://my.telegram.org (API development tools)
   #   2. Put them in a .env file next to this compose file:
@@ -32,12 +42,19 @@ services:
   #   3. docker compose up -d
   #   4. In AnimeLK Storage -> Manage -> Upload Settings -> your Telegram channel,
   #      set Proxy URL to:  http://telegram-bot-api:8088
+  #      (call logOut once on api.telegram.org first if the bot was used there,
+  #       then wait ~10 minutes before the bot can log in here)
   telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
+    image: gramiojs/telegram-bot-api:latest
     environment:
       TELEGRAM_API_ID: ${TG_API_ID}
       TELEGRAM_API_HASH: ${TG_API_HASH}
-    command: ["--local", "--http-port", "8088", "--dir=/var/lib/telegram-bot-api"]
+      TELEGRAM_LOCAL: "1"
+      TELEGRAM_HTTP_PORT: "8088"
+      # Bundled nginx file server on port 8080 (Docker-internal only):
+      # serves the stored files over HTTP with Range support, which the app
+      # uses via TG_FILE_SERVER_URL for streaming/downloads of any size.
+      FILE_SERVER: "1"
     volumes:
       - ./telegram-api-data:/var/lib/telegram-bot-api
     restart: unless-stopped

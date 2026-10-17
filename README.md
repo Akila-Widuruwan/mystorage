@@ -132,10 +132,14 @@ The cloud Telegram Bot API caps bot uploads at **50 MB** — that's why uploads 
 
 1. Get a free `api_id` + `api_hash` at [my.telegram.org](https://my.telegram.org) → *API development tools*
 2. Put them in a `.env` file next to `docker-compose.yml` (`TG_API_ID=...`, `TG_API_HASH=...`)
-3. `docker compose up -d`
+3. `docker compose up -d` — this also starts the Bot API server (the maintained `gramiojs/telegram-bot-api` image)
 4. In **Manage → Upload Settings → your Telegram channel**, set the **Proxy URL** to `http://telegram-bot-api:8088`
 
 The app reads `TG_MAX_SINGLE_MB=1900` (already set in the compose file) and sends files up to 1.9 GB to Telegram as **one single document** — perfect for the bundled GitHub Actions episode workflow (`tools/github-workflows/episode-to-animestorage.yml`, set *Upload mode* = `full`). Without the local server the app keeps the safe 16 MB chunked behavior automatically.
+
+### How file downloads work with the local Bot API server
+
+In `--local` mode, `getFile` returns an **absolute disk path** and the Bot API server does **not** serve files over HTTP at `/file/bot...` (the compose pins the maintained `gramiojs/telegram-bot-api` image — the old `aiogram` build has not been rebuilt since 2022 and its file download route does not work). The compose file therefore also enables the image's bundled file server (`FILE_SERVER=1` — nginx serving the storage with HTTP **Range support** for smooth video streaming) and points the app at it via `TG_FILE_SERVER_URL`. Download URLs become token-less `http://telegram-bot-api:8080/<bot_id>/...`, reachable only inside the Docker network. Note: `logOut` on the cloud API once before switching a bot to the local server, and files uploaded before the switch may need re-uploading (file references don't survive the migration).
 
 ## Uploading manually from the Telegram app (and importing them)
 
